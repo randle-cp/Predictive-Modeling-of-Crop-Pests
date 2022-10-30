@@ -1,0 +1,81 @@
+---
+title: "A_Occurence_Data_Cleaning"
+author: "Randle"
+date: "8/4/2021"
+output: html_document
+---
+
+
+## Front Matter
+The following script was developed cooperatively by the SHSU SDM working group, including Laura	Bianchi, Austin	Brenek, Jesus	Castillo, Nick 	Galle, Kayla	Hankins, Kenneth	Nobleza, Chris	Randle, Nico	Reger, Alyssa	Russell, Ava	Stendahl based on [tutorials](https://rspatial.org/) provided by Robert Hijmans and Jane Elith. Chris Randle composed the following script from many scripts developed by the SHSU SDM working group.
+
+*This works best if your environment is empty at the start.*
+
+# Libraries
+```{r Load-libraries}
+#this is a chunk
+library(dismo)
+library(sp)
+library(maptools)
+```
+# Genus and Species strings
+**Their are many places in this code where you will need to save files with filenames including the genus and species. We'll save these as strings to automate the creation of file names. Enter your genus name and specific epithet in the quotes below.**
+```{r}
+genus<-"Alectra"
+species<-"vogelii"
+```
+# **A.** Obtaining occurrence data from [GBIF](https://www.gbif.org/)
+The following code will take you through the process of harvesting data from the GBIF database and removing 
+
+1. Getting raw data from GBIF.
+In the chunk below, change species name to the one that you are developing a model for. Leave in the asterisk, if you want data from subsepecific taxa
+```{r A1._Getting-raw-GBIF-data}
+sdmdata <- gbif(genus, species, geo=FALSE)
+```
+
+2. Now remove all data without latitude and longitude
+```{r A2._Removing-data-without-lat-or-long-and-visualize}
+#subset keeps only rows of a data frame which meet the criteria that lon is not NA and that lat is not NA
+sdmdata <- subset(sdmdata, !is.na(lon) & !is.na(lat))
+##and visualize the data
+#first lets get the extent of the data (the coordinates of the smallest box needed to encapsulate the data)  To do this I first need to convert sdmdata into a dataframe with the same coordinates as "wrldsmpl"
+sdmdataframe<-data.frame(sdmdata)
+data(wrld_simpl)
+coordinates(sdmdataframe) <- ~lon+lat
+crs(sdmdataframe) <- crs(wrld_simpl)
+#And then extract the extent
+e<-extent(sdmdataframe)
+xmin<-xmin(e)
+xmax<-xmax(e)
+ymin<-ymin(e)
+ymax<-ymax(e)
+# and then plot a map and add the points from sdmdata
+plot(wrld_simpl, xlim=c(xmin,xmax), ylim=c(ymin,ymax), axes=TRUE, col="light yellow")
+box()
+points(sdmdata$lon, sdmdata$lat, col='red', cex=0.75)
+```
+
+3a. Note the points that fall outside the home range. There are two ways to deal with this. One is to create a file that can be examined in excel. To do this, substitute a name for the file in the following code. 
+
+```{r A3a._Write-a-csv-file-for-examination-in-MS-excel}
+write.csv(sdmdata, file=paste0(genus,"_",species,"_raw.csv"))
+```
+
+4. Remove points with the same latitude and longitude. Duplicated points will give to much importance to the variables where they are located.
+```{r A5.-Remove-duplicate-points}
+dups <-duplicated(sdmdata[ c('lon', 'lat'),])
+#How many duplicates were there?
+sum(dups)
+sdmdata<-sdmdata[!dups,]
+#and check the size...
+dim(sdmdata)
+```
+
+
+
+5. At this point save your data as a csv, so we can access it again in the next stage. Make sure you name it something good
+```{r 7A. Export-clean-data-as-CSV}
+outdata<-data.frame(cbind(sdmdata$phylum, sdmdata$class, sdmdata$order, sdmdata$family, sdmdata$genus, sdmdata$species, sdmdata$country, sdmdata$adm1, sdmdata$lon, sdmdata$lat))
+colnames(outdata)<-c("phylum","class", "order", "family", "genus", "species", "country", "adm1", "lon", "lat")
+write.csv(outdata, file=paste0(genus,"_",species,"_clean.csv"), row.names=FALSE)
+```

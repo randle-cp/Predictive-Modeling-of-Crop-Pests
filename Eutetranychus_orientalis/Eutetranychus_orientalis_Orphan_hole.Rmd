@@ -1,0 +1,496 @@
+---
+title: "Orphan_Hole_Eutetranychus_orientalis"
+author: "Randle"
+date: "10/23/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Front Matter
+
+This is a fix to the problem of "orphan holes" that results from our circle method of generating pseudoabsence data. In June I wrote a solution that requires lots of work on the user end; if the number of clusters varies, then the user has to add or remove lots of code. This is a pain in the ass and unworkable for beginners. I want to go ahead and automate the process, and then build it into an SDM template that will work for all users.
+
+# Libraries
+```{r 1_Load-libraries}
+library(dismo)
+library(sp)
+library(raster)
+library(stats)
+library(dplyr)
+library(knitr)
+library(rgeos)
+library(maptools)
+library(rgdal)
+library(ecospat)
+library(usdm)
+library(mgcv)
+library(sf)
+```
+```{r}
+genus<-'Eutetranychus'
+species<-'orientalis'
+```
+
+
+# Data
+Let's start with predictors
+```{r 2_predictors}
+predictors<-stack('/Users/shsu/RTemps/Climond_elev_HI.tif')
+bands<-c("Ann_mean_temp",	"Mean_durnal_temp_range",	"Isothermality",	"Temp_Seasonality",	"MaxTemp_WarmestWeek",	"MinTemp_ColdestWeek",	"Temp_Annual_Range",	"Mean_temp_wettest_q",	"Mean_temp_driest_q",	"Mean_temp_warmiest_q",	"Mean_temp_coldest_q",	"Ann_ precip",	"Precip_driest_week",	"Precip_wettest_week",	"Precip_Seasonality",	"Precip_wettest_q",	"Precip_driest_q",	"Precip_warmest_q",	"Precip_coldest_q",	"Ann_mean_rad",	"Hghest_weekly_rad",	"Lowest_weekly_rad",	"Rad_seasonality",	"Rad_wettest_q",	"Rad_driest_q",	"Rad_warmest_q",	"Rad_coldest_q",	"Ann_mean_moisture",	"Highsets_weekly_moisture",	"Lowest_weekly_moisture",	"Moisture_seasonality",	"Mean_moisture_wettest_q",	"Mean_moisture_driest_q",	"Mean_moisture_warmest_q",	"Mean_moisture_coldest_q",	"Elev", 'human_impact')
+names(predictors)<-bands
+cool<-colorRampPalette(c('gray','green','dark green',"blue"))
+warm<-colorRampPalette(c('yellow', 'orange', 'red', 'brown', 'black'))
+
+```
+
+Let's open up the entire data set.
+```{r}
+sdmdata<-read.csv('Eutetranychus_orientalis_clean.csv')
+```
+Let's divide the data into training and testing data sets.
+The following code divides the data set into 80% training and 20% testing.
+```{r B2.Training_testing}
+#let's make sdmdata into a dataframe
+data(wrld_simpl)
+coordinates(sdmdata) <- ~lon+lat
+crs(sdmdata) <- crs(wrld_simpl)
+
+#let's extract just the coordinates
+presence <- coordinates(sdmdata)
+#First we'll make a random list of integers from 1-5 as long as our presence data. Setting the seed results in a repeatable random process
+set.seed(0)
+#now make a list as long as the number of rows in presence consisting of a random series of integers from 1-5
+group <- kfold(presence, 5)
+#Then we want to use this to retrieve the number of the rows in the presence data that are associated with the number 1 in our group index.
+test_indices <- as.integer(row.names(presence[group == 1, ]))
+#and create a new list of coordinates including only those rows that are NOT in test indices. These are all the row numbers NOT corresponding with the test_indices (which is ~80% of the data).
+pres_train <- presence[-test_indices,]
+#and those that do correspond with test indices (20%) of the data
+pres_test <- presence[group ==1,]
+```
+
+Save pres_data and test_data as csv files just in case.
+```{r}
+#first presdata_train
+outdata<-data.frame(pres_train)
+colnames(outdata)<-c("lon","lat")
+write.csv(outdata, file=paste0(genus,"_",species,"_train.csv"), row.names=FALSE)
+
+#and then presdata_test
+outdata<-data.frame(pres_test)
+colnames(outdata)<-c("lon","lat")
+write.csv(outdata, file=paste0(genus,"_",species,"_test.csv"), row.names=FALSE)
+```
+
+# Cluster identification and sorting
+And then we need to discover the number of clusters and set that number. I do not want to automate this, because I don't think the method is fool proof, and I would like to have it mapped carefully. Let's start by visualizing the data.
+```{r 4_Visualize-data}
+data(wrld_simpl)
+pres_train_df<-as.data.frame(pres_train)
+coordinates(pres_train_df) <- ~lon+lat
+crs(pres_train_df) <- crs(wrld_simpl)
+#And then extract the extent
+e<-extent(pres_train_df)
+xmin<-xmin(e)
+xmax<-xmax(e)
+ymin<-ymin(e)
+ymax<-ymax(e)
+# and then plot a map and add the points from sdmdata
+plot(wrld_simpl, xlim=c(xmin,xmax), ylim=c(ymin,ymax), axes=TRUE, col="light yellow")
+box()
+points(pres_train_df$lon, pres_train_df$lat, col='red', cex=0.75)
+```
+W
+We'll use a method of sums of squares to determine what the optimal number of clusters is.
+```{r 5_sum-of-squares_cluster_ID}
+#First we need to estimate variance...this is new code for me, but the "apply" command is part of the base packages and applies a function to either rows (1), or columns (2) of a matrix, returning a matrix
+variance<-apply(pres_train,2,var)
+# find the sum of squares for all of the data treated as one cluster
+SS = (nrow(pres_train)-1)*sum(variance)
+# find the sum of squares for 2 to 15 clusters
+for (i in 2:15) {
+  clusters<-kmeans(pres_train, centers=i)
+  SS[i] <- sum(clusters$withinss)
+}
+# plot the result
+plot(1:15, SS, type="b", xlab="Number of Clusters",ylab="Within groups sum of squares")
+```
+We want to pick out the smallest number of clusters possible that will give us the smallest sum of squares. This is an exercise in eyeballing. You'll note that going from one to two clusters greatly decreases the sum of squares, so two is better than one. Three is only slightly better than two and four is better than three. After five, there is really no imporvement. Let's see what happens with four clusters. 
+```{r 6_nclusters}
+nclusters<-2
+```
+So let's go ahead and make a list with elements composed of all of the points in each cluster.
+```{r 7_sort-clusters-into-list}
+# K-Means Cluster Analysis-- assigns each point to one of ncluster number of clusters.
+ClusterInfo <- kmeans(pres_train, nclusters) 
+#and make a vector including the cluster assignement of each row
+cluster_assignments<-ClusterInfo$cluster
+#and divide the coordinates by cluster...first we make empty indices for each cluster
+by_cluster<-c()
+cluster_index<-vector()
+#and loop...so for every integer 1-5, we create an index of samples in that cluster, and then sample that cluster and append it to the cluster + 1 slot of the list
+for (i in 1:nclusters){
+  cluster_index<-cluster_assignments==i
+  cluster<-pres_train[cluster_index,]
+  by_cluster[[length(by_cluster)+1]]<-cluster
+}
+```
+And now I want to turn those all into spatial points data
+```{r 8_list_of_clusters_as_spdf}
+#lapply applys a function to all elements of a list
+by_cluster<-lapply(by_cluster, SpatialPoints)
+```
+
+# Creating polygons around the clusters
+And generate a set of distance matrices for each cluster of coordinates, replace the zeros with 'na' and calculate the mean. The result will be in kilometers but we need it in meters, so we will multiply it by 1000.
+```{r 9_distance_matrices}
+dists<-lapply(by_cluster,spDists,longlat=TRUE)
+dists<-lapply(dists,function(x) replace(x,x==0,NA))
+mean_dists<-lapply(dists, mean, na.rm=TRUE)
+mean_dists<-lapply(mean_dists, function(x) x*1000)
+```
+And now we need to make our circles as a separate list, and then convert them into polygons.
+```{r 10_circles_to_polygons}
+circles<-list()
+circle<-vector()
+for (i in 1:nclusters){
+  circle<-circles(by_cluster[[i]], d=mean_dists[[i]], lonlat=TRUE)
+  circles[[length(circles)+1]]<-circle
+}
+#and turn those circles into polygons
+pol<-lapply(circles, polygons)
+#this creates a list of spatial polygons, but I want a spatial polygon data frame with all of them shits in it
+spol <- bind(pol)
+spol <- SpatialPolygonsDataFrame(spol, data.frame(id=1:length(spol))) 
+#and let's go ahead and plot those
+plot(wrld_simpl, xlim=c(xmin,xmax), ylim=c(ymin,ymax), axes=TRUE, col="light yellow")
+plot(spol, add=TRUE)
+box()
+points(pres_train, col='red', cex=0.1)
+```
+
+#Selecting random samples from polygons
+OK...now we need to figure out how to sample from the polygons...We also want to sample in proportion to the number of rows in each cluster.
+```{r 11_random_sample_points}
+abs_raw<-list()
+for (i in 1:nclusters){
+  samp <- spsample(pol[[i]], nrow(coordinates(by_cluster[[i]]))*1000, type='random', iter=25)
+  abs_raw[[length(abs_raw)+1]]<-samp
+}
+```
+Let's see if these fit in the polygons.
+```{r XX-remove-just-a-check-while-writing}
+plot(wrld_simpl, xlim=c(xmin,xmax), ylim=c(ymin,ymax), axes=TRUE, col="light yellow")
+plot(spol, add=TRUE)
+box()
+points(abs_raw[[1]], col='red', cex=0.2)
+points(abs_raw[[2]], col='blue', cex=0.2)
+```
+OK...now I need to remove all points that aren't associated with environmental data. Let's sample environmental data, make an index of complete cases and then sample those cases from abs_raw.
+
+```{r}
+#we are going to sample environmental data from all of the points that have environmental data to sample
+abs_train_data<-list()
+for (i in 1:nclusters){
+  data<-extract(predictors, abs_raw[[i]])
+  abs_train_data[[length(abs_train_data)+1]]<-data
+}
+#and then select only those points that have associated data
+complete<-lapply(abs_train_data, complete.cases)
+abs_train<-list()
+for (i in 1:nclusters){
+  comp<-abs_raw[[i]][complete[[i]],]
+  abs_train[[length(abs_train)+1]]<-comp
+}
+#and let's have a look
+plot(wrld_simpl, xlim=c(xmin,xmax), ylim=c(ymin,ymax), axes=TRUE, col="light yellow")
+plot(spol, add=TRUE)
+box()
+points(abs_train[[1]], col='red', cex=0.2)
+points(abs_train[[2]], col='blue', cex=0.2)
+```
+
+Awesome!  Lots of points all inside polygons and on land. Let's deconstruct and randomize.
+```{r}
+abs_train_spdf<-do.call(rbind,abs_train)
+abs_train_df<-as.data.frame(abs_train_spdf)
+set.seed(0)
+random_index<-sample(nrow(abs_train_df))
+abs_train_random<-abs_train_df[random_index,]
+```
+And plot
+```{r}
+plot(wrld_simpl, xlim=c(xmin,xmax), ylim=c(ymin,ymax), axes=TRUE, col="light yellow")
+plot(spol, add=TRUE)
+box()
+points(abs_train_random, cex=0.1)
+```
+OK...from here on out its pretty standard SDM...cut and paste from the SDM_MethodsV3.rmd
+And now we will use the VIFstep function to identify layers contributing most to collinearity (variance inflation factor). Rather than do this from a raster, I think it makes much more sense to do this from a dataframe in which we have sampled all the layers at the presence points only. This is because the larger a species distribution is, the lower the probability of collinearity across the range, even if layers are collinier where the species actually exists in the range.
+```{r}
+#extract environmental data using the points in sdmdata
+env_data<-extract(predictors,sdmdata)
+#give names to the columns
+colnames(env_data)<-bands
+#run the vif
+vif<-vifstep(env_data)
+#and let's find the layers that were excluded and drop them
+excluded<-vif@excluded
+predictors<-dropLayer(predictors,excluded)
+#and let's just go ahead and see which layers were dropped.
+NClayers<-names(predictors)
+NClayers
+```
+## General additive model
+# Data preparation
+
+And let's go ahead and extract the presence data, remove rows with NA values, and add a column of 1s.
+```{r}
+pres_train_data<-extract(predictors,pres_train)
+complete<-complete.cases(pres_train_data)
+pres_train_data<-pres_train_data[complete,]
+pres_train_data<-cbind(pres_train_data,1)
+```
+
+
+Now we want to extract predictors for the absence data, remove rows with NA values and chop it down to the size of our presence training data, and combine these into one data frame with column names (pa is the last column of 0,1 which indicates presence or absence)
+```{r}
+#first let's just grab 10000 rows randomly from the randomized absence data
+set.seed(0)
+abs_train_GAM<-abs_train_random[sample(1:nrow(pres_train)),]
+abs_train_data_GAM<-extract(predictors,abs_train_GAM)
+#and plot these
+plot(wrld_simpl, xlim=c(xmin,xmax), ylim=c(ymin,ymax), axes=TRUE, col="light yellow")
+plot(spol, add=TRUE)
+box()
+points(abs_train_GAM)
+```
+
+
+```{r}
+#and add a column of zeros to the end.
+abs_train_data_GAM<-cbind(abs_train_data_GAM,0)
+#put the two matrices together and name the colmns
+train_data<-rbind(pres_train_data,abs_train_data_GAM)
+colnames(train_data)<-c(names(predictors),"pa")
+train_data<-as.data.frame(train_data)
+```
+
+# Training the GAM and making predictions. 
+**This is a pain in the neck because all of the layers have to be specified. I recommend printing the column names in the console `colnames(train_data)` and then copying them to Excel and formatting them**
+```{r}
+gam <- gam(pa ~  Ann_.precip + Rad_driest_q + Highsets_weekly_moisture + Mean_moisture_coldest_q + human_impact + Rad_seasonality + Rad_warmest_q + Mean_moisture_warmest_q + Elev,                      
+           family = binomial(link = "logit"), data=train_data)
+summary(gam)
+```
+Let's make some predictions and export them to a file
+```{r}
+GAMpreds <- predict(predictors, gam, type = 'response')
+writeRaster(GAMpreds, filename = paste0(genus,"_",species,"_GAM.tif"), overwrite=TRUE)
+plot(GAMpreds, main=c(genus,species,'GAM/Binary'),col=warm(100), zlim=c(0,1), xlim=c(-140, -50), ylim=c(20, 50))
+points(pres_test, col='white', cex =.4, pch=3)
+```
+
+## MaxEnt
+We need many more background points for MaxEnt and BRT than we needed for GAM. Let's go ahead and generate those.
+```{r}
+set.seed(0)
+background_train<-abs_train_random[sample(1:10000),]
+```
+Let's go ahead and set a locations for java
+**This will obviously be specialized for your computer. Try to find the 'home' folder in java and specify the path below**
+```{r}
+Sys.setenv(JAVA_HOME='C:\\Program Files\\Java\\jdk-11.0.1')
+```
+First we let the program know to start up maxent using the command maxent. After that, all we need to do is to make a model oject (me_model), from the raster data and the presence training data.
+```{r}
+maxent()
+me_model <- maxent(predictors, pres_train, a=background_train)
+#and plot the models most important layers
+par(mfrow=c(1,1))
+plot(me_model)
+```
+
+Let's go ahead and make some predictions
+```{r}
+MEpreds<-predict(predictors, me_model, type='response')
+writeRaster(MEpreds, filename=paste0(genus,"_",species,"_ME2.tif"))
+#and plot
+plot(MEpreds, col=warm(100), zlim=c(0,1), xlim=c(-140, -50), ylim=c(20, 50))
+```
+
+## Boosted regression trees
+We need to prepare data for BRT in much the same way that we did for GAM, with the exception that we will need a lot more background data.  We can use the 10,000 points that we already generated for ME
+```{r}
+#let's get the data from our predictors
+bg_train_data<-extract(predictors,background_train)
+#and bind a column of 0 to the end of it
+bg_train_data<-cbind(bg_train_data,0)
+#and convert it to a data frame
+bg_train_data<-as.data.frame(bg_train_data)
+#and then combine it withe the presence training data
+pres_train_data<-as.data.frame(pres_train_data)
+BRT_data<-rbind(pres_train_data, bg_train_data)
+colnames(BRT_data)<-c(names(predictors),"pa")
+```
+And now we can train a model using the first X columns of train_data and the 6th as the response. Let's start with tree complexity of 5 and learning rate of 0.001
+```{r}
+sdm.tc5.lr001 <- gbm.step(data=BRT_data, gbm.x = 1:nlayers(predictors), gbm.y = ncol(BRT_data), family = "bernoulli", tree.complexity = 5, learning.rate = 0.001, bag.fraction = 0.5)
+summary(sdm.tc5.lr001)
+```
+
+**Note: you may want to try different combinations!  If your trees are converging too slowly, raise the tree complexity by 1 or two, and back the learning rate down.  On the other hand of your holdout deviance drops very quickly and slowly starts to rise, you are overfitting. Drop the tree complexity and raise the learning rate.**
+
+Let's make predictions and save them
+```{r}
+BRTpreds<-predict(predictors, sdm.tc5.lr001, type='response')
+writeRaster(BRTpreds, filename=paste0(genus,"_", species,"_BRT.tif"), overwrite=TRUE)
+#and plot
+plot(BRTpreds, col=warm(100), zlim=c(0,1), xlim=c(-140, -50), ylim=c(20, 50))
+```
+
+## Evaluation
+We want to generate the following metrics for each of the three models: AUC, COR, maximum Kappa, TRS, and it wouldn't kill us to have a Boyce graph either.
+
+### Absence Testing Data
+Let's go ahead and just sample from the data that we already have.
+```{r}
+abs_test <- abs_train_random[sample(1:nrow(pres_test)),]
+#You'll get a warning saying that your CRS object has lost a comment. This is unimportant and can be ignored.
+```
+
+### GAM evaluation
+```{r}
+p<-extract(GAMpreds,pres_test)
+a<-extract(GAMpreds,abs_test)
+#And let's get rid of nasty NA values and shrink a to the size of p
+p<-p[!is.na(p)]
+a<-a[!is.na(a)]
+a<-a[1:length(p)]
+#Let's look at the shape of these data
+#lets weld all the data together
+all_vals<-c(p,a)
+e<-evaluate(p=p,a=a)
+AUC_GAM<-e@auc
+COR_GAM<-e@cor
+pa<-c(replicate(length(p),1),replicate(length(a),0))
+kappaGAM<-ecospat.max.kappa(all_vals,pa)
+TSS_GAM<-ecospat.max.tss(all_vals,pa)
+print(paste('Max kappa: ', kappaGAM[2] ))
+print(paste('TSS:', TSS_GAM[[2]]))
+e
+```
+And let's go ahead and estimate the Boyce Index
+
+```{r}
+ecospat.boyce(fit=GAMpreds,pres_test,nclass=0,PEplot = TRUE)
+```
+
+ME Evaluation
+
+```{r}
+p<-extract(MEpreds,pres_test)
+a<-extract(MEpreds,abs_test)
+#And let's get rid of nasty NA values and shrink a to the size of p
+p<-p[!is.na(p)]
+a<-a[!is.na(a)]
+a<-a[1:length(p)]
+#Let's look at the shape of these data
+#lets weld all the data together
+all_vals<-c(p,a)
+e<-evaluate(p=p,a=a)
+AUC_ME<-e@auc
+COR_ME<-e@cor
+pa<-c(replicate(length(p),1),replicate(length(a),0))
+kappaME<-ecospat.max.kappa(all_vals,pa)
+TSS_ME<-ecospat.max.tss(all_vals,pa)
+print(paste('Max kappa: ', kappaME[2] ))
+print(paste('TSS:', TSS_ME[[2]]))
+e
+```
+
+And let's go ahead and estimate the Boyce Index
+```{r}
+ecospat.boyce(fit=MEpreds,pres_test,nclass=0,PEplot = TRUE)
+```
+
+BRT Evaluation
+
+```{r}
+p<-extract(BRTpreds,pres_test)
+a<-extract(BRTpreds,abs_test)
+#And let's get rid of nasty NA values and shrink a to the size of p
+p<-p[!is.na(p)]
+a<-a[!is.na(a)]
+a<-a[1:length(p)]
+#Let's look at the shape of these data
+#lets weld all the data together
+all_vals<-c(p,a)
+e<-evaluate(p=p,a=a)
+AUC_BRT<-e@auc
+COR_BRT<-e@cor
+pa<-c(replicate(length(p),1),replicate(length(a),0))
+kappaBRT<-ecospat.max.kappa(all_vals,pa)
+TSS_BRT<-ecospat.max.tss(all_vals,pa)
+print(paste('Max kappa: ', kappaBRT[2] ))
+print(paste('TSS:', TSS_BRT[[2]]))
+e
+```
+
+And let's go ahead and estimate the Boyce Index
+```{r}
+ecospat.boyce(fit=BRTpreds,pres_test,nclass=0,PEplot = TRUE)
+```
+
+# Making the ensemble and evaluation
+
+The ensemble is simply the average of GAM, ME, and BRT predictions weighted by AUC.
+```{r}
+ENSpreds<-(GAMpreds*AUC_GAM+MEpreds*AUC_ME+BRTpreds*AUC_BRT)/(AUC_GAM+AUC_ME+AUC_BRT)
+writeRaster(ENSpreds, filename=paste0(genus,"_",species,"_ENS.tif"), overwrite=TRUE)
+plot(ENSpreds, col=cool(100), zlim=c(0,1), xlim=c(-140, -50), ylim=c(20, 50))
+```
+And let's evaluate
+```{r}
+p<-extract(ENSpreds,pres_test)
+a<-extract(ENSpreds,abs_test)
+#And let's get rid of nasty NA values and shrink a to the size of p
+p<-p[!is.na(p)]
+a<-a[!is.na(a)]
+a<-a[1:length(p)]
+#Let's look at the shape of these data
+#lets weld all the data together
+all_vals<-c(p,a)
+e<-evaluate(p=p,a=a)
+AUC_ENS<-e@auc
+COR_ENS<-e@cor
+pa<-c(replicate(length(p),1),replicate(length(a),0))
+kappaENS<-ecospat.max.kappa(all_vals,pa)
+TSS_ENS<-ecospat.max.tss(all_vals,pa)
+print(paste('Max kappa: ', kappaENS[2] ))
+print(paste('TSS:', TSS_ENS[[2]]))
+e
+```
+and the Boyce ploy for the ensemble
+
+```{r}
+ecospat.boyce(fit=ENSpreds,pres_test,nclass=0,PEplot = TRUE)
+```
+
+
+and finally let's make a table of evaluation metrics
+```{r}
+#Let's go in this order of columns, left to right: AUC, COR, Kappa, TSS
+eGAM<-c(AUC_GAM,COR_GAM,kappaGAM[2], TSS_GAM[[2]])
+eME<-c(AUC_ME, COR_ME, kappaME[2],TSS_ME[[2]])
+eBRT<-c(AUC_BRT, COR_BRT, kappaBRT[2],TSS_BRT[[2]])
+eENS<-c(AUC_ENS, COR_ENS, kappaENS[2], TSS_ENS[[2]])
+all_evals<-rbind(eGAM,eME,eBRT,eENS)
+colnames(all_evals)<-c("AUC", "COR","MaxKappa","TSS")
+rownames(all_evals)<-c("GAM","MaxEnt", "BRT", "Ensemble")
+write.csv(all_evals, file=paste0(genus,"_",species, '_eval.csv'))
+```
+
